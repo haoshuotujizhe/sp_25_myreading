@@ -113,6 +113,68 @@ EKF（扩展卡尔曼滤波器）的调参核心就是调整你提供的代码�
 - 1.初始化坐标系与相机参数
 - 2.计算装甲板3D信息：先根据装甲板的类型（大或小），PNP解算出旋转和平移矩阵，再通过坐标系的转换，最终求到yaw，pitch，distance
 - 3.重投影误差最小化：设定搜索范围，遍历计算重投影误差，选择最优偏航角
+#### *****MPC轨迹规划器*****
+作用：  
+基于模型预测控制（MPC）为云台（yaw/pitch）生成平滑且受约束的角度、角速度与角加速度轨迹（Plan），用于替代直接角度命令以提高跟踪平稳性与命中率。规划器把目标的未来期望角度/速度作为参考，考虑系统动力学、输入/状态约束与代价函数，在线求解有限时域最优控制问题，输出下一步控制与预测轨迹供云台或下位机执行。
+
+输入：
+- 跟踪模块输出的 `Target`（目标角度、角速度、预测态）或短期 `Trajectory`（期望 yaw/pitch 的时间序列）；
+- 当前云台状态（yaw/pitch、速度、时间戳），通常由 IO 层（云台反馈）提供；
+- 子弹速度、延迟补偿等弹道参数（用于把目标位置转为参考角度）；
+- MPC 配置（预测步长 N、采样时间 dt、权重矩阵 Q/R、输入/状态上下界、ADMM 求解器参数 rho/tol/max_iter），来自配置文件或 codegen 导出的静态数据；
+- （可选）上一次解作为 warm-start。
+
+输出：
+- `auto_aim::Plan`：包含控制开关（control）、开火标志（fire）、目标角度 `target_yaw/target_pitch`，以及 yaw/pitch 在多个时刻的 position/velocity/acceleration（用于云台平滑跟随或下位机执行）；
+- 求解器诊断信息（迭代次数、收敛/失败标志、残差），用于日志与回退策略。
+
+实现文件（位于 `tasks/auto_aim/planner`）：
+- `planner.hpp` / `planner.cpp`：高层 `Planner` 类，维护 `yaw`/`pitch` 两个 `TinySolver` 实例，负责将 `Target`/`Trajectory` 转换为 MPC 问题、调用求解器并组装 `Plan`；
+- `tinympc/`：轻量级 MPC 内核（ADMM 实现）
+  - `tiny_api.hpp` / `tiny_api.cpp`：对外 C 风格接口（如 `tiny_setup`、`tiny_set_x_ref`、`tiny_set_u_ref`、`tiny_solve`、`tiny_get_solution` 等）；
+  - `types.hpp`：solver、solution、settings 与缓存等数据结构定义；
+  - `admm.cpp`：ADMM 求解器核心循环；
+  - `rho_benchmark.*`：自适应 rho 的估计与矩阵更新工具；
+  - `codegen.*`：将预计算矩阵导出为静态 C++ 数据的工具（便于嵌入式部署）。
+
+典型流程（`Planner::plan` 的执行步骤）：
+1. 参考轨迹生成／预处理  
+  - 将输入的 `Target` 或 `aim` 结果转换为短期参考轨迹（位置/速度/加速度），长度为预测步数 N（`get_trajectory`）。
+2. 构建离散系统与 MPC 问题数据  
+  - 设置离散动力学矩阵 A/B、状态维度 nx、输入维度 nu、初始状态 x0、权重 Q/R、约束 x_min/x_max/u_min/u_max、采样时间 dt 等（构造时或从 codegen 加载）。
+3. 将数据通过 tinympc API 传入求解器  
+  - 调用 `tiny_set_x_ref` / `tiny_set_u_ref` / `tiny_set_bounds` / `tiny_set_initial_state` 等接口；若启用 warm-start，则写入上一次解。 
+4. 调用求解器求解  
+  - 调用 `tiny_solve`（内部运行 ADMM），迭代至收敛或达到 `max_iter`。若启用自适应 rho，会在迭代间调整 rho 并更新缓存。 
+5. 提取结果并封装  
+  - 从 `TinySolution` 中读取最优状态/控制序列，取首步控制或首时刻的 pos/vel/acc 填充 `auto_aim::Plan`；记录求解器状态供上层决策。 
+6. 失败/降级策略  
+  - 若求解失败或未收敛，返回退化策略（例如直接返回 `aim` 角度、使用简单 PD 控制或保持上一命令），并写入诊断日志。
+
+集成与运行上下文：
+- 在 `src/standard_mpc` 等应用中，会启动独立的 MPC 线程：该线程从 target 队列读取最新 `Target` 与当前云台状态，调用 `Planner::plan` 生成 `Plan`，并通过 IO 层或命令生成模块将 `Plan` 下发给云台或下位机；主线程负责相机采集、检测与 Tracker 管理。 
+- 当前实现通常为轴分离的两个独立求解器（`yaw_solver_`、`pitch_solver_`）；也可扩展为联合状态的单一求解器以处理耦合。 
+
+可配置项与需调参的关键参数：
+- 预测步数 N 与采样时间 dt（影响预测能力与计算量）；
+- 权重矩阵 Q（跟踪误差）与 R（控制量）；
+- 输入/状态约束（转速/加速度上限）；
+- ADMM 参数：rho、tol、max_iter、是否启用自适应 rho；
+- 是否启用 warm-start、是否使用 `codegen` 常量化矩阵以减少在线开销。
+
+调试建议与常见问题：
+- 可视化参考轨迹 `X_ref/U_ref` 与解出的 `x/u` 以定位模型不匹配或权重设置问题；
+- 若常不收敛，尝试调整 rho、放宽 tol、增加 max_iter 或启用 warm-start；
+- 若实时性不足，可减小 N、使用 `codegen` 静态矩阵或关闭自适应 rho；
+- 实现失败回退（保持上一命令或使用 PID）以避免云台突跳；
+- 部署到嵌入式设备时优先使用 `codegen` 导出的常量并减少在线矩阵组装。 
+
+关键文件定位（便于后续修改）：
+- `tasks/auto_aim/planner/planner.hpp` / `planner.cpp`（Planner 高层逻辑）；
+- `tasks/auto_aim/planner/tinympc/tiny_api.hpp` / `.cpp`、`admm.cpp`、`types.hpp`（MPC 内核）；
+
+小结：  
+MPC 轨迹规划器把目标预测、系统动力学、约束与代价整合为有限时域最优控制问题，通过 `tinympc`（基于 ADMM）在线求解，输出平滑的角度/速度/加速度轨迹。主要调参点在模型匹配（A/B）、权重与约束、ADMM 的 rho/tol，以及实时性优化（N、codegen、warm-start）。
 ### auto_buff
 包括识别器detect，估计器target，决策器aimer，坐标转换器solver
 #### 识别器
@@ -387,3 +449,9 @@ EKF（扩展卡尔曼滤波器）的调参核心就是调整你提供的代码�
 7. 如果我们要对这颗树改进优化，无论是想加一个枝条这种大改动，还是具体到某个叶子的某个函数的改动，只要我们清楚整体的结构流程，定位到我们要改动的点，写好要迭代的部分，并且做好要迭代的部分的输入输出的匹配（使其能够与整个树的流程相匹配契合），就可以实现在整个大树上不断的优化迭代改进
 
 同济项目报告大体就这些了，别的不太重要或者好理解的就没写，然后MPC规划也没写，后面有空搞懂再慢慢补吧，这个报告的初衷更多的是在我细致的读过各种内部代码过后，帮我理一遍整体的框架和流程，以及后面要用同济的代码的话，可以更快的定位一些具体的函数功能之类的
+## 反刍
+### 重投影：关于为什么auto_aim_test有这么多重投影的框
+1. 通过YOLO识别一帧图像，然后YOLO回返回一个outputs，再通过outputs向量获得Armor，里面包含狠多，有识别的装甲板的颜色，编号，边界框等等，再用for循环将Armor传入Armors，这样Armors就包括很多YOLO识别出来的一个个装甲板的信息
+2. 再通过tracker对识别的Armors进行跟踪分类筛选，，，最终从Armors返回一个最优装甲板targets
+3. 至于为什么重投影会有这么多的框，是因为Target里的armor_xyza_list()函数，就是通过一个装甲板的位置，结合装甲板的半径，中心，角度，求出另外三个装甲板的每个角点的坐标，然后把所有的交点坐标和框都画出来
+4. 作为非科班出身的我对c++的理解还是太浅了，再看代码的时候对类，私有变量的和公有函数变量有了更深的认识，对类的封装性有了更深的理解
